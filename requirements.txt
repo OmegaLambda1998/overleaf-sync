@@ -1,7 +1,8 @@
-requests
-beautifulsoup4
+asyncclick
 yaspin
 python-dateutil
-click
-socketIO-client==0.5.7.2 # Do not upgrade!
+requests
+bs4
+tornado
 PySide6
+lxml

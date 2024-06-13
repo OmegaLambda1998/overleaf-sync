@@ -6,22 +6,22 @@
 ##################################################
 # File: olsync.py
 # Description: Overleaf Two-Way Sync
-# Author: Moritz Glöckl
+# Original Author: Moritz Glöckl
+# Modifications: Patrick Armstrong
 # License: MIT
-# Version: 1.2.0
+# Version: 1.3.0
 ##################################################
 
-import click
+import asyncclick as click
 import os
 from yaspin import yaspin
 import pickle
-import zipfile
-import io
 import dateutil.parser
 import glob
 import fnmatch
 import traceback
 from pathlib import Path
+import asyncio
 
 try:
     # Import for pip installation / wheel
@@ -47,9 +47,10 @@ except ImportError:
               help="Path to the .olignore file relative to sync path (ignored if syncing from remote to local). See "
                    "fnmatch / unix filename pattern matching for information on how to use it.")
 @click.option('-v', '--verbose', 'verbose', is_flag=True, help="Enable extended error logging.")
+@click.option('-f', '--no_fail', 'no_fail', is_flag=True, help="Exceptions are recorded and printed, rather than stopping execution")
 @click.version_option(package_name='overleaf-sync')
 @click.pass_context
-def main(ctx, local, remote, project_name, cookie_path, sync_path, olignore_path, verbose):
+async def main(ctx, local, remote, project_name, cookie_path, sync_path, olignore_path, verbose, no_fail):
     if ctx.invoked_subcommand is None:
         if not os.path.isfile(cookie_path):
             raise click.ClickException(
@@ -64,27 +65,32 @@ def main(ctx, local, remote, project_name, cookie_path, sync_path, olignore_path
         os.chdir(sync_path)
 
         project_name = project_name or os.path.basename(os.getcwd())
-        project = execute_action(
-            lambda: overleaf_client.get_project(project_name),
+        project = await execute_action(
+            overleaf_client.get_project,
             "Querying project",
             "Project queried successfully.",
             "Project could not be queried.",
-            verbose)
+            verbose,
+            no_fail,
+            project_name)
 
-        project_infos = execute_action(
-            lambda: overleaf_client.get_project_infos(project["id"]),
+        project_infos = await execute_action(
+            overleaf_client.get_project_infos,
             "Querying project details",
             "Project details queried successfully.",
             "Project details could not be queried.",
-            verbose)
-
-        zip_file = execute_action(
-            lambda: zipfile.ZipFile(io.BytesIO(
-                overleaf_client.download_project(project["id"]))),
+            verbose,
+            no_fail,
+            project["id"])
+        
+        zip_file = await execute_action(
+            overleaf_client.download_project,
             "Downloading project",
             "Project downloaded successfully.",
             "Project could not be downloaded.",
-            verbose)
+            verbose,
+            no_fail,
+            project["id"])
 
         if not os.path.isfile(olignore_path):
             click.echo("\nNotice: .olignore file does not exist, will sync all items.")
@@ -94,7 +100,13 @@ def main(ctx, local, remote, project_name, cookie_path, sync_path, olignore_path
         sync = not (local or remote)
 
         if remote or sync:
-            sync_func(
+            await execute_action(
+                sync_func,
+                f"Syncing remote to local",
+                f"Syncing remote to local was succesful.",
+                f"Error syncing remote to local.",
+                verbose,
+                no_fail,
                 files_from=zip_file.namelist(),
                 deleted_files=[f for f in olignore_keep_list(olignore_path) if f not in zip_file.namelist() and not sync],
                 create_file_at_to=lambda name: write_file(name, zip_file.read(name)),
@@ -103,13 +115,18 @@ def main(ctx, local, remote, project_name, cookie_path, sync_path, olignore_path
                     project["id"], project_infos, name, os.path.getsize(name), open(name, 'rb')),
                 from_exists_in_to=lambda name: os.path.isfile(name),
                 from_equal_to_to=lambda name: open(name, 'rb').read() == zip_file.read(name),
-                from_newer_than_to=lambda name: dateutil.parser.isoparse(project["lastUpdated"]).timestamp() >
-                                                os.path.getmtime(name),
+                from_newer_than_to=lambda name: dateutil.parser.isoparse(project["lastUpdated"]).timestamp() > os.path.getmtime(name),
                 from_name="remote",
                 to_name="local",
-                verbose=verbose)
+                verbose_sync=verbose)
         if local or sync:
-            sync_func(
+            await execute_action(
+                sync_func,
+                f"Syncing local to remote",
+                f"Syncing local to remote was succesful.",
+                f"Error syncing local to remote.",
+                verbose,
+                no_fail,
                 files_from=olignore_keep_list(olignore_path),
                 deleted_files=[f for f in zip_file.namelist() if f not in olignore_keep_list(olignore_path) and not sync],
                 create_file_at_to=lambda name: overleaf_client.upload_file(
@@ -122,31 +139,38 @@ def main(ctx, local, remote, project_name, cookie_path, sync_path, olignore_path
                     project["lastUpdated"]).timestamp(),
                 from_name="local",
                 to_name="remote",
-                verbose=verbose)
+                verbose_sync=verbose)
 
 
 @main.command()
 @click.option('--path', 'cookie_path', default=".olauth", type=click.Path(exists=False),
               help="Path to store the persisted Overleaf cookie.")
 @click.option('-v', '--verbose', 'verbose', is_flag=True, help="Enable extended error logging.")
-def login(cookie_path, verbose):
+@click.option('-f', '--no_fail', 'no_fail', is_flag=True, help="Exceptions are recorded and printed, rather than stopping execution")
+async def login(cookie_path, verbose, no_fail):
     if os.path.isfile(cookie_path) and not click.confirm(
             'Persisted Overleaf cookie already exist. Do you want to override it?'):
         return
-    click.clear()
-    execute_action(lambda: login_handler(cookie_path), "Login",
-                   "Login successful. Cookie persisted as `" + click.format_filename(
-                       cookie_path) + "`. You may now sync your project.",
-                   "Login failed. Please try again.", verbose)
+    await execute_action(
+        login_handler,
+        "Login",
+        "Login successful. Cookie persisted as `" + click.format_filename(
+            cookie_path) + "`. You may now sync your project.",
+        "Login failed. Please try again.",
+        verbose,
+        no_fail,
+        cookie_path)
 
 
 @main.command(name='list')
 @click.option('--store-path', 'cookie_path', default=".olauth", type=click.Path(exists=False),
               help="Relative path to load the persisted Overleaf cookie.")
 @click.option('-v', '--verbose', 'verbose', is_flag=True, help="Enable extended error logging.")
-def list_projects(cookie_path, verbose):
-    def query_projects():
-        for index, p in enumerate(sorted(overleaf_client.all_projects(), key=lambda x: x['lastUpdated'], reverse=True)):
+@click.option('-f', '--no_fail', 'no_fail', is_flag=True, help="Exceptions are recorded and printed, rather than stopping execution")
+@click.option('-a', '--all', 'list_all', is_flag=True, help="List all projects, including archived and trashed.")
+async def list_projects(cookie_path, verbose, no_fail, list_all):
+    async def query_projects(project_list):
+        for index, p in enumerate(sorted(project_list, key=lambda x: x['lastUpdated'], reverse=True)):
             if not index:
                 click.echo("\n")
             click.echo(f"{dateutil.parser.isoparse(p['lastUpdated']).strftime('%m/%d/%Y, %H:%M:%S')} - {p['name']}")
@@ -161,10 +185,19 @@ def list_projects(cookie_path, verbose):
 
     overleaf_client = OverleafClient(store["cookie"], store["csrf"])
 
-    click.clear()
-    execute_action(query_projects, "Querying all projects",
-                   "Querying all projects successful.",
-                   "Querying all projects failed. Please try again.", verbose)
+    if list_all:
+        project_list = overleaf_client.all_projects
+    else:
+        project_list = overleaf_client.active_projects
+
+    await execute_action(
+        query_projects,
+        "Querying all projects",
+        "Querying all projects successful.",
+        "Querying all projects failed. Please try again.",
+        verbose,
+        no_fail,
+        project_list)
 
 
 @main.command(name='download')
@@ -174,16 +207,19 @@ def list_projects(cookie_path, verbose):
 @click.option('--store-path', 'cookie_path', default=".olauth", type=click.Path(exists=False),
               help="Relative path to load the persisted Overleaf cookie.")
 @click.option('-v', '--verbose', 'verbose', is_flag=True, help="Enable extended error logging.")
-def download_pdf(project_name, download_path, cookie_path, verbose):
-    def download_project_pdf():
+@click.option('-f', '--no_fail', 'no_fail', is_flag=True, help="Exceptions are recorded and printed, rather than stopping execution")
+async def download_pdf(project_name, download_path, cookie_path, verbose, no_fail):
+    async def download_project_pdf():
         nonlocal project_name
         project_name = project_name or os.path.basename(os.getcwd())
-        project = execute_action(
-            lambda: overleaf_client.get_project(project_name),
+        project = await execute_action(
+            overleaf_client.get_project,
             "Querying project",
             "Project queried successfully.",
             "Project could not be queried.",
-            verbose)
+            verbose,
+            no_fail,
+            project_name)
 
         file_name, content = overleaf_client.download_pdf(project["id"])
 
@@ -204,14 +240,16 @@ def download_pdf(project_name, download_path, cookie_path, verbose):
 
     overleaf_client = OverleafClient(store["cookie"], store["csrf"])
 
-    click.clear()
+    await execute_action(
+        download_project_pdf,
+        "Downloading project's PDF",
+        "Downloading project's PDF successful.",
+        "Downloading project's PDF failed. Please try again.",
+        no_fail,
+        verbose)
 
-    execute_action(download_project_pdf, "Downloading project's PDF",
-                   "Downloading project's PDF successful.",
-                   "Downloading project's PDF failed. Please try again.", verbose)
 
-
-def login_handler(path):
+async def login_handler(path):
     store = olbrowserlogin.login()
     if store is None:
         return False
@@ -244,9 +282,7 @@ def write_file(path, content):
         f.write(content)
 
 
-def sync_func(files_from, deleted_files, create_file_at_to, delete_file_at_to, create_file_at_from, from_exists_in_to,
-              from_equal_to_to, from_newer_than_to, from_name,
-              to_name, verbose=False):
+async def sync_func(files_from, deleted_files, create_file_at_to, delete_file_at_to, create_file_at_from, from_exists_in_to, from_equal_to_to, from_newer_than_to, from_name, to_name, verbose_sync=False):
     click.echo("\nSyncing files from [%s] to [%s]" % (from_name, to_name))
     click.echo('=' * 40)
 
@@ -292,10 +328,11 @@ def sync_func(files_from, deleted_files, create_file_at_to, delete_file_at_to, c
         click.echo("\t%s" % name)
         try:
             create_file_at_to(name)
-        except:
+        except Exception as e:
+            err_msg = f"\n[ERROR] An error occurred while creating new file(s) on [{to_name}]"
             if verbose:
-                print(traceback.format_exc())
-            raise click.ClickException("\n[ERROR] An error occurred while creating new file(s) on [%s]" % to_name)
+                err_msg += f"\n{e}"
+            raise click.ClickException(err_msg)
 
     click.echo(
         "\n[NEW] Following new file(s) created on [%s]" % from_name)
@@ -303,10 +340,11 @@ def sync_func(files_from, deleted_files, create_file_at_to, delete_file_at_to, c
         click.echo("\t%s" % name)
         try:
             create_file_at_from(name)
-        except:
+        except Exception as e:
+            err_msg = f"\n[ERROR] An error occurred while creating new file(s) on [{from_name}]"
             if verbose:
-                print(traceback.format_exc())
-            raise click.ClickException("\n[ERROR] An error occurred while creating new file(s) on [%s]" % from_name)
+                err_msg += f"\n{e}"
+            raise click.ClickException(err_msg)
 
     click.echo(
         "\n[UPDATE] Following file(s) updated on [%s]" % to_name)
@@ -314,10 +352,11 @@ def sync_func(files_from, deleted_files, create_file_at_to, delete_file_at_to, c
         click.echo("\t%s" % name)
         try:
             create_file_at_to(name)
-        except:
+        except Exception as e:
+            err_msg = f"\n[ERROR] An error occurred while updating file(s) on [{to_name}]"
             if verbose:
-                print(traceback.format_exc())
-            raise click.ClickException("\n[ERROR] An error occurred while updating file(s) on [%s]" % to_name)
+                err_msg += f"\n{e}"
+            raise click.ClickException(err_msg)
 
     click.echo(
         "\n[DELETE] Following file(s) deleted on [%s]" % to_name)
@@ -325,10 +364,11 @@ def sync_func(files_from, deleted_files, create_file_at_to, delete_file_at_to, c
         click.echo("\t%s" % name)
         try:
             delete_file_at_to(name)
-        except:
+        except Exception as e:
+            err_msg = f"\n[ERROR] An error occurred while deleting file(s) on [{to_name}]"
             if verbose:
-                print(traceback.format_exc())
-            raise click.ClickException("\n[ERROR] An error occurred while creating new file(s) on [%s]" % to_name)
+                err_msg += f"\n{e}"
+            raise click.ClickException(err_msg)
 
     click.echo(
         "\n[SYNC] Following file(s) are up to date")
@@ -348,26 +388,7 @@ def sync_func(files_from, deleted_files, create_file_at_to, delete_file_at_to, c
     click.echo("")
     click.echo("✅  Synced files from [%s] to [%s]" % (from_name, to_name))
     click.echo("")
-
-
-def execute_action(action, progress_message, success_message, fail_message, verbose_error_logging=False):
-    with yaspin(text=progress_message, color="green") as spinner:
-        try:
-            success = action()
-        except:
-            if verbose_error_logging:
-                print(traceback.format_exc())
-            success = False
-
-        if success:
-            spinner.write(success_message)
-            spinner.ok("✅ ")
-        else:
-            spinner.fail("💥 ")
-            spinner.write(fail_message)
-            #raise click.ClickException(fail_message)
-
-        return success
+    return True
 
 
 def olignore_keep_list(olignore_path):
@@ -393,6 +414,32 @@ def olignore_keep_list(olignore_path):
     keep_list = [Path(item).as_posix() for item in keep_list if not os.path.isdir(item)]
     return keep_list
 
+async def execute_action(action, progress_message, success_message, fail_message, verbose=False, no_fail=False, *args, **kwargs):
+    with yaspin(text=progress_message, color="green") as spinner:
+        if verbose:
+            spinner.write(f'Executing {action}')
+        success = False
+        try:
+            success = await action(*args, **kwargs)
+        except asyncio.TimeoutError:
+            spinner.write("Timeout error occurred.")
+        except Exception as e:
+            if verbose:
+                spinner.write(f'{traceback.format_exc()}')
+                spinner.write(f'{e}')
+
+        if success:
+            spinner.write(success_message)
+            spinner.ok("✅ ")
+        else:
+            spinner.fail("💥 ")
+            spinner.write(fail_message)
+            if verbose:
+                spinner.write(f'{action} return {success}')
+            if not no_fail:
+                raise click.ClickException(fail_message)
+
+        return success
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

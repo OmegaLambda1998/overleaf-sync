@@ -11,30 +11,30 @@
 
 import requests as reqs
 from bs4 import BeautifulSoup
-from socketIO_client import SocketIO
 import json
 import uuid
 import time
 import re
-from itertools import count
-from websockets.sync.client import connect
-import logging
-logger = logging.getLogger('websockets')
-logger.setLevel(logging.DEBUG)
-logger.addHandler(logging.StreamHandler())
+import zipfile
+import io
+
+from tornado.httpclient import HTTPRequest
+from tornado.websocket import websocket_connect
+  
+# The Overleaf Base URL
+BASE_URL = "https://www.overleaf.com"
 
 # Where to get the CSRF Token and where to send the login request to
-LOGIN_URL = "https://www.overleaf.com/login"
-PROJECT_URL = "https://www.overleaf.com/project"  # The dashboard URL
+BASE_PROJECT_URL = f"{BASE_URL}/project"
+PROJECT_URL = lambda project_id: f"{BASE_PROJECT_URL}/{project_id}"  # The dashboard URL
 # The URL to download all the files in zip format
-DOWNLOAD_URL = "https://www.overleaf.com/project/{}/download/zip"
-UPLOAD_URL = "https://www.overleaf.com/project/{}/upload"  # The URL to upload files
-FOLDER_URL = "https://www.overleaf.com/project/{}/folder"  # The URL to create folders
-DELETE_URL = "https://www.overleaf.com/project/{}/doc/{}"  # The URL to delete files
-COMPILE_URL = "https://www.overleaf.com/project/{}/compile?enable_pdf_caching=true"  # The URL to compile the project
-BASE_URL = "https://www.overleaf.com"  # The Overleaf Base URL
+DOWNLOAD_URL = lambda project_id: f"{PROJECT_URL(project_id)}/download/zip"
+UPLOAD_URL = lambda project_id: f"{PROJECT_URL(project_id)}/upload"  # The URL to upload files
+FOLDER_URL = lambda project_id: f"{PROJECT_URL(project_id)}/folder"  # The URL to create folders
+DELETE_URL = lambda project_id, file_type, file_id: f"{PROJECT_URL(project_id)}/{file_type}/{file_id}"  # The URL to delete files
+COMPILE_URL = lambda project_id: f"{PROJECT_URL(project_id)}/compile?enable_pdf_caching=true"  # The URL to compile the project
 PATH_SEP = "/"  # Use hardcoded path separator for both windows and posix system
-SOCKETIO_PATH = "socket.io/1"
+
 
 class OverleafClient(object):
     """
@@ -52,95 +52,72 @@ class OverleafClient(object):
                     yield p
 
     def __init__(self, cookie=None, csrf=None):
+        self.http_handler = reqs.Session()
         self._cookie = cookie  # Store the cookie for authenticated requests
         self._csrf = csrf  # Store the CSRF token since it is needed for some requests
+        self.all_projects = self.get_all_projects()
+        self.active_projects = self.get_active_projects()
+    
+    def safe_get(self, url, *args, **kwargs):
+        try:
+            response = self.http_handler.get(url, cookies=self._cookie, *args, **kwargs)
+            response.raise_for_status()
+        except Exception as e:
+            raise e
+        return response
 
-    def login(self, username, password):
+    def safe_post(self, url, *args, **kwargs):
+        try:
+            response = self.http_handler.post(url, cookies=self._cookie, *args, **kwargs)
+            response.raise_for_status()
+        except Exception as e:
+            raise e
+        return response
+
+
+    def get_all_projects(self):
         """
-        WARNING - DEPRECATED - Not working as Overleaf introduced captchas
-        Login to the Overleaf Service with a username and a password
-        Params: username, password
-        Returns: Dict of cookie and CSRF
+        Get all of a user's projects, including archived and trashed
+        Returns: List of project objects or None
         """
-
-        get_login = reqs.get(LOGIN_URL)
-        self._csrf = BeautifulSoup(get_login.content, 'html.parser').find(
-            'input', {'name': '_csrf'}).get('value')
-        login_json = {
-            "_csrf": self._csrf,
-            "email": username,
-            "password": password
-        }
-        post_login = reqs.post(LOGIN_URL, json=login_json,
-                               cookies=get_login.cookies)
-
-        # On a successful authentication the Overleaf API returns a new authenticated cookie.
-        # If the cookie is different than the cookie of the GET request the authentication was successful
-        if post_login.status_code == 200 and get_login.cookies["overleaf_session2"] != post_login.cookies[
-            "overleaf_session2"]:
-            self._cookie = post_login.cookies
-
-            # Enrich cookie with GCLB cookie from GET request above
-            self._cookie['GCLB'] = get_login.cookies['GCLB']
-
-            # CSRF changes after making the login request, new CSRF token will be on the projects page
-            projects_page = reqs.get(PROJECT_URL, cookies=self._cookie)
-            self._csrf = BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-csrfToken'}) \
-                .get('content')
-
-            return {"cookie": self._cookie, "csrf": self._csrf}
-
-    def all_projects(self):
+        project_page = self.safe_get(BASE_PROJECT_URL)
+        soup = BeautifulSoup(project_page.content, 'lxml')
+        meta = soup.find('meta', {'content': re.compile('\\{.*"projects".*\\}')})
+        if meta is not None:
+            return json.loads(meta.get('content')).get('projects')
+        return None
+    
+    def get_active_projects(self):
         """
         Get all of a user's active projects (= not archived and not trashed)
-        Returns: List of project objects
+        Returns: List of project objects or None
         """
-        projects_page = reqs.get(PROJECT_URL, cookies=self._cookie)
-        #json_content = json.loads(
-        #    BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-projects'}).get('content'))
-        #)
-        #json_content = json.loads(
-        #    BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-prefetchedProjectsBlob'}).get('content')).get('projects')
-        json_content = json.loads(
-                BeautifulSoup(
-                    projects_page.content, 'html.parser'
-                ).find(
-                    'meta', {'content': re.compile('\\{.*"projects".*\\}')}
-                ).get('content')
-        ).get('projects')
-        return list(OverleafClient.filter_projects(json_content))
+        if self.all_projects is not None:
+            filtered_projects = OverleafClient.filter_projects(self.all_projects)
+            if filtered_projects is not None:
+                return list(filtered_projects)
+        return None
 
-    def get_project(self, project_name):
+    async def get_project(self, project_name):
         """
         Get a specific project by project_name
         Params: project_name, the name of the project
         Returns: project object
         """
+        
+        if self.all_projects is not None:
+            return next(OverleafClient.filter_projects(self.all_projects, {"name": project_name}), None)
 
-        projects_page = reqs.get(PROJECT_URL, cookies=self._cookie)
-        #json_content = json.loads(
-        #    BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-projects'}).get('content'))
-        #)
-        #json_content = json.loads(
-        #    BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-prefetchedProjectsBlob'}).get('content')).get('projects')
-        json_content = json.loads(
-                BeautifulSoup(
-                    projects_page.content, 'html.parser'
-                ).find(
-                    'meta', {'content': re.compile('\\{.*"projects".*\\}')}
-                ).get('content')
-        ).get('projects')
 
-        return next(OverleafClient.filter_projects(json_content, {"name": project_name}), None)
-
-    def download_project(self, project_id):
+    async def download_project(self, project_id, as_zip=True):
         """
         Download project in zip format
         Params: project_id, the id of the project
         Returns: bytes string (zip file)
         """
-        r = reqs.get(DOWNLOAD_URL.format(project_id),
-                     stream=True, cookies=self._cookie)
+        r = self.safe_get(DOWNLOAD_URL(project_id), stream=True)
+        if as_zip:
+            return zipfile.ZipFile(io.BytesIO(r.content))
         return r.content
 
     def create_folder(self, project_id, parent_folder_id, folder_name):
@@ -162,8 +139,7 @@ class OverleafClient(object):
         headers = {
             "X-Csrf-Token": self._csrf
         }
-        r = reqs.post(FOLDER_URL.format(project_id),
-                      cookies=self._cookie, headers=headers, json=params)
+        r = self.safe_post(FOLDER_URL(project_id), headers=headers, json=params)
 
         if r.ok:
             return json.loads(r.content)
@@ -173,7 +149,8 @@ class OverleafClient(object):
         else:
             raise reqs.HTTPError()
 
-    def get_project_infos(self, project_id):
+    # Implementation HEAVILY based off of https://github.com/da-h/AirLatex.vim/
+    async def get_project_infos(self, project_id):
         """
         Get detailed project infos about the project
 
@@ -182,43 +159,102 @@ class OverleafClient(object):
 
         Returns: project details
         """
-        project_infos = None
 
-        # Callback function for the joinProject emitter
-        def set_project_infos(a, project_infos_dict, c, d):
-            # Set project_infos variable in outer scope
-            nonlocal project_infos
-            project_infos = project_infos_dict
-
-        # Convert cookie from CookieJar to string
         cookie = f"GCLB={self._cookie['GCLB']}; overleaf_session2={self._cookie['overleaf_session2']}"
-
-        channel_info = reqs.get(
-            f"{BASE_URL}/{SOCKETIO_PATH}/?t={int(time.time())}",
-            headers={'Cookie': cookie}
-        ).text.split(':')[0]
-
-        socket_url = f'{BASE_URL}/{SOCKETIO_PATH}/websocket/{channel_info}'.replace('http', 'ws')
-        command_count = count(1)
         codere = re.compile(r"(\d):(?:(\d+)(\+?))?:(?::(?:(\d+)(\+?))?(.*))?")
+        requests = {}
 
+        async def getWebSocketURL():
+            channel_info = self.safe_get(
+                f"{BASE_URL}/socket.io/1/?projectId={project_id}&t={int(time.time())}",
+                headers={'Cookie': cookie}
+            )
+            ws_channel = channel_info.text[0:channel_info.text.find(':')]
+            web_socket_url = f'{BASE_URL}/socket.io/1/websocket/{ws_channel}?projectId={project_id}'.replace('http', 'ws')
+            print(f'\n{web_socket_url}')
+            return web_socket_url
 
-        def send_cmd(ws, cmd):
-            cmd_msg = f'5:{str(next(command_count))}+::{json.dumps(cmd)}'
-            ws.send(cmd_msg)
+        async def connect():
+            request = HTTPRequest(await getWebSocketURL(), headers={'Cookie': cookie})
+            return await websocket_connect(request)
+        
+        async def run():
+            project_infos = None
+            try:
+                ws = await connect()
+                while project_infos is None:
+                    response = await ws.read_message()
 
-        def read_response(ws):
-            response = ws.recv()
+                    print(f'\nRaw response: {response}')
 
-            code, await_id, await_mult, answer_id, answer_mult, data = codere.match(response).groups()
-            return code, await_id, await_mult, answer_id, answer_mult, data 
+                    if response is None:
+                        break
 
-        def send_recieve(ws, cmd):
-            send_cmd(ws, cmd)
-            return read_response(ws)
+                    code, await_id, await_mult, answer_id, answer_mult, data = codere.match(response).groups()
 
-        with connect(socket_url, additional_headers={'Cookie': cookie}) as websocket:
-            read_response(websocket)
+                    if data:
+                        try:
+                            data = json.loads(data)
+                        except:
+                            data = {"name":"error"}
+
+                    # error occured
+                    if code == "0":
+                        break
+
+                    # first message
+                    elif code == "1":
+                        pass
+
+                    # keep alive
+                    elif code == "2":
+                        await keep_alive()
+
+                    # server request
+                    elif code == "5":
+                        if not isinstance(data, dict):
+                            pass
+
+                        # connection accepted => join Project
+                        if data["name"] == "connectionAccepted":
+                            await join_project()
+
+                        elif data["name"] == "joinProjectResponse":
+                            project_infos = data["args"]
+
+                        # unknown message
+                        else:
+                            raise Exception(f"Unknown server request: {data}\nResponse: {response}")
+
+                    # answer to our request
+                    elif code == "6":
+
+                        # get request command
+                        request = requests[answer_id]
+                        cmd = request["name"]
+
+                        # joinProject => server lists project information
+                        if cmd == "joinProject":
+                            project_infos = data[1]
+
+                        # unknown answer
+                        else:
+                            raise Exception(f"Server responded to unknown request: {cmd}\nResponse: {response}")
+
+                    # Unauthorised
+                    elif code == "7":
+                        raise Exception(f"Error: Unauthorized, refresh Presistent Overleaf cookies by logging in again.\nResponse: {response}")
+
+                    # unknown message
+                    else:
+                        raise Exception(f"Server responsded with unknown code: {code}\nResponse: {response}")
+
+            except Exception as e:
+                raise e
+
+            return project_infos
+
+        project_infos = await run()
 
         return project_infos
 
@@ -270,7 +306,7 @@ class OverleafClient(object):
         }
 
         # Upload the file to the predefined folder
-        r = reqs.post(UPLOAD_URL.format(project_id), cookies=self._cookie, params=params, files=files)
+        r = self.safe_post(UPLOAD_URL(project_id), params=params, files=files)
 
         return r.status_code == str(200) and json.loads(r.content)["success"]
 
@@ -311,7 +347,7 @@ class OverleafClient(object):
             "X-Csrf-Token": self._csrf
         }
 
-        r = reqs.delete(DELETE_URL.format(project_id, file['_id']), cookies=self._cookie, headers=headers, json={})
+        r = reqs.delete(DELETE_URL(project_id, 'doc', file['_id']), cookies=self._cookie, headers=headers, json={})
 
         return r.status_code == str(204)
 
@@ -336,7 +372,7 @@ class OverleafClient(object):
             "stopOnFirstError": False
         }
 
-        r = reqs.post(COMPILE_URL.format(project_id), cookies=self._cookie, headers=headers, json=body)
+        r = self.safe_post(COMPILE_URL(project_id), headers=headers, json=body)
 
         if not r.ok:
             raise reqs.HTTPError()
@@ -348,7 +384,7 @@ class OverleafClient(object):
 
         pdf_file = next(v for v in compile_result['outputFiles'] if v['type'] == 'pdf')
 
-        download_req = reqs.get(BASE_URL + pdf_file['url'], cookies=self._cookie, headers=headers)
+        download_req = self.safe_get(BASE_URL + pdf_file['url'], headers=headers)
 
         if download_req.ok:
             return pdf_file['path'], download_req.content

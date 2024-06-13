@@ -14,14 +14,21 @@ from PySide6.QtWidgets import *
 from PySide6.QtWebEngineWidgets import *
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings, QWebEnginePage
 
+
+# The Overleaf Base URL
+BASE_URL = "https://www.overleaf.com"
+
+
 # Where to get the CSRF Token and where to send the login request to
-LOGIN_URL = "https://www.overleaf.com/login"
-PROJECT_URL = "https://www.overleaf.com/project"  # The dashboard URL
+LOGIN_URL = f"{BASE_URL}/login"
+BASE_PROJECT_URL = f"{BASE_URL}/project"
+
 # JS snippet to get the first link
-#JAVASCRIPT_EXTRACT_PROJECT_URL = "document.getElementsByClassName('project-list-table-name-link')[0].href"
 JAVASCRIPT_EXTRACT_PROJECT_URL = "q=0;for (const c of document.getElementsByTagName('a')) { if(c.href.indexOf('/project/') > 0) { q=c.href; break; } }; q"
+
 # JS snippet to extract the csrfToken
 JAVASCRIPT_CSRF_EXTRACTOR = "document.getElementsByName('ol-csrfToken')[0].content"
+
 # Name of the cookies we want to extract
 COOKIE_NAMES = ["overleaf_session2", "GCLB"]
 
@@ -71,7 +78,7 @@ class OlBrowserLoginWindow(QMainWindow):
                 )
             )
 
-        if self.webview.url().toString() == PROJECT_URL:
+        if self.webview.url().toString() == BASE_PROJECT_URL:
             self.webview.page().runJavaScript(
                 JAVASCRIPT_EXTRACT_PROJECT_URL, 0, callback
             )

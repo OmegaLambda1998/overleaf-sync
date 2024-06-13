@@ -32,21 +32,16 @@ if [[ $# == 0 ]]; then
     if [ ! -f "$OLAUTH" ]; then
         SOFTWARE_ARGS="login --path $OLAUTH --verbose"
     else
-        SOFTWARE_ARGS="--help"
+        SOFTWARE_ARGS="--store-path $OLAUTH --verbose"
     fi
-
 # Default args when just a command is passed
-elif [[ $# == 1 ]]; then
-    case "$SOFTWARE_ARGS" in
-        "login")
-            SOFTWARE_ARGS="$SOFTWARE_ARGS --path $OLAUTH"
-            ;;
-        *)
-            SOFTWARE_ARGS="$SOFTWARE_ARGS --store-path $OLAUTH"
-            ;;
-    esac
-    SOFTWARE_ARGS="$SOFTWARE_ARGS --verbose"
+elif [ "$SOFTWARE_ARGS" = "login" ]; then
+    SOFTWARE_ARGS="$SOFTWARE_ARGS --path $OLAUTH"
+else
+    SOFTWARE_ARGS="$SOFTWARE_ARGS --store-path $OLAUTH --verbose"
 fi
 
+
 # Run software, passing all args from this script onwards
+echo "Executing $SOFTWARE $SOFTWARE_ARGS"
 $SOFTWARE $SOFTWARE_ARGS
