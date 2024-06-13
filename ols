@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+# Follow however many symlinks are needed to get the true directory and name of this script
+SOURCE=${BASH_SOURCE[0]}
+while [ -L "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
+    DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
+    SOURCE=$(readlink "$SOURCE")
+    [[ $SOURCE != /* ]] && SOURCE=$DIR/$SOURCE # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+SCRIPT_DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
+SCRIPT_NAME="$( basename "$SOURCE" )"
+PYVENV="${PYVENV:-$HOME/.pyvenv}"
+VENV="$PYVENV/overleaf-sync"
+
+# Overleaf authentication
+OLAUTH="$SCRIPT_DIR/.olauth"
+
+#
+# Do any setup needed
+#
+deactivate 2> /dev/null
+source "$VENV/bin/activate"
+
+# Path to software entry point
+SOFTWARE="$SCRIPT_DIR/olsync/olsync.py"
+
+# Add any default args here
+SOFTWARE_ARGS=$@
+
+# Default command
+if [[ $# == 0 ]]; then
+    if [ ! -f "$OLAUTH" ]; then
+        SOFTWARE_ARGS="login --path $OLAUTH --verbose"
+    else
+        SOFTWARE_ARGS="--help"
+    fi
+
+# Default args when just a command is passed
+elif [[ $# == 1 ]]; then
+    case "$SOFTWARE_ARGS" in
+        "login")
+            SOFTWARE_ARGS="$SOFTWARE_ARGS --path $OLAUTH"
+            ;;
+        *)
+            SOFTWARE_ARGS="$SOFTWARE_ARGS --store-path $OLAUTH"
+            ;;
+    esac
+    SOFTWARE_ARGS="$SOFTWARE_ARGS --verbose"
+fi
+
+# Run software, passing all args from this script onwards
+$SOFTWARE $SOFTWARE_ARGS

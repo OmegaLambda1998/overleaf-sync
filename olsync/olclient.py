@@ -11,10 +11,17 @@
 
 import requests as reqs
 from bs4 import BeautifulSoup
+from socketIO_client import SocketIO
 import json
 import uuid
-from socketIO_client import SocketIO
 import time
+import re
+from itertools import count
+from websockets.sync.client import connect
+import logging
+logger = logging.getLogger('websockets')
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.StreamHandler())
 
 # Where to get the CSRF Token and where to send the login request to
 LOGIN_URL = "https://www.overleaf.com/login"
@@ -27,6 +34,7 @@ DELETE_URL = "https://www.overleaf.com/project/{}/doc/{}"  # The URL to delete f
 COMPILE_URL = "https://www.overleaf.com/project/{}/compile?enable_pdf_caching=true"  # The URL to compile the project
 BASE_URL = "https://www.overleaf.com"  # The Overleaf Base URL
 PATH_SEP = "/"  # Use hardcoded path separator for both windows and posix system
+SOCKETIO_PATH = "socket.io/1"
 
 class OverleafClient(object):
     """
@@ -88,8 +96,18 @@ class OverleafClient(object):
         Returns: List of project objects
         """
         projects_page = reqs.get(PROJECT_URL, cookies=self._cookie)
+        #json_content = json.loads(
+        #    BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-projects'}).get('content'))
+        #)
+        #json_content = json.loads(
+        #    BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-prefetchedProjectsBlob'}).get('content')).get('projects')
         json_content = json.loads(
-            BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-projects'}).get('content'))
+                BeautifulSoup(
+                    projects_page.content, 'html.parser'
+                ).find(
+                    'meta', {'content': re.compile('\\{.*"projects".*\\}')}
+                ).get('content')
+        ).get('projects')
         return list(OverleafClient.filter_projects(json_content))
 
     def get_project(self, project_name):
@@ -100,8 +118,19 @@ class OverleafClient(object):
         """
 
         projects_page = reqs.get(PROJECT_URL, cookies=self._cookie)
+        #json_content = json.loads(
+        #    BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-projects'}).get('content'))
+        #)
+        #json_content = json.loads(
+        #    BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-prefetchedProjectsBlob'}).get('content')).get('projects')
         json_content = json.loads(
-            BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-projects'}).get('content'))
+                BeautifulSoup(
+                    projects_page.content, 'html.parser'
+                ).find(
+                    'meta', {'content': re.compile('\\{.*"projects".*\\}')}
+                ).get('content')
+        ).get('projects')
+
         return next(OverleafClient.filter_projects(json_content, {"name": project_name}), None)
 
     def download_project(self, project_id):
@@ -162,30 +191,34 @@ class OverleafClient(object):
             project_infos = project_infos_dict
 
         # Convert cookie from CookieJar to string
-        cookie = "GCLB={}; overleaf_session2={}" \
-            .format(
-            self._cookie["GCLB"],
-            self._cookie["overleaf_session2"]
-        )
+        cookie = f"GCLB={self._cookie['GCLB']}; overleaf_session2={self._cookie['overleaf_session2']}"
 
-        # Connect to Overleaf Socket.IO, send a time parameter and the cookies
-        socket_io = SocketIO(
-            BASE_URL,
-            params={'t': int(time.time())},
+        channel_info = reqs.get(
+            f"{BASE_URL}/{SOCKETIO_PATH}/?t={int(time.time())}",
             headers={'Cookie': cookie}
-        )
+        ).text.split(':')[0]
 
-        # Wait until we connect to the socket
-        socket_io.on('connect', lambda: None)
-        socket_io.wait_for_callbacks()
+        socket_url = f'{BASE_URL}/{SOCKETIO_PATH}/websocket/{channel_info}'.replace('http', 'ws')
+        command_count = count(1)
+        codere = re.compile(r"(\d):(?:(\d+)(\+?))?:(?::(?:(\d+)(\+?))?(.*))?")
 
-        # Send the joinProject event and receive the project infos
-        socket_io.emit('joinProject', {'project_id': project_id}, set_project_infos)
-        socket_io.wait_for_callbacks()
 
-        # Disconnect from the socket if still connected
-        if socket_io.connected:
-            socket_io.disconnect()
+        def send_cmd(ws, cmd):
+            cmd_msg = f'5:{str(next(command_count))}+::{json.dumps(cmd)}'
+            ws.send(cmd_msg)
+
+        def read_response(ws):
+            response = ws.recv()
+
+            code, await_id, await_mult, answer_id, answer_mult, data = codere.match(response).groups()
+            return code, await_id, await_mult, answer_id, answer_mult, data 
+
+        def send_recieve(ws, cmd):
+            send_cmd(ws, cmd)
+            return read_response(ws)
+
+        with connect(socket_url, additional_headers={'Cookie': cookie}) as websocket:
+            read_response(websocket)
 
         return project_infos
 

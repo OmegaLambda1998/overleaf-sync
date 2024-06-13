@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """Overleaf Two-Way Sync Tool"""
 ##################################################
 # MIT License
@@ -83,6 +85,11 @@ def main(ctx, local, remote, project_name, cookie_path, sync_path, olignore_path
             "Project downloaded successfully.",
             "Project could not be downloaded.",
             verbose)
+
+        if not os.path.isfile(olignore_path):
+            click.echo("\nNotice: .olignore file does not exist, will sync all items.")
+        else:
+            click.echo("\n.olignore: using %s to filter items" % olignore_path)
 
         sync = not (local or remote)
 
@@ -187,6 +194,7 @@ def download_pdf(project_name, download_path, cookie_path, verbose):
 
         return True
 
+    click.echo('='*40)
     if not os.path.isfile(cookie_path):
         raise click.ClickException(
             "Persisted Overleaf cookie not found. Please login or check store path.")
@@ -356,7 +364,8 @@ def execute_action(action, progress_message, success_message, fail_message, verb
             spinner.ok("✅ ")
         else:
             spinner.fail("💥 ")
-            raise click.ClickException(fail_message)
+            spinner.write(fail_message)
+            #raise click.ClickException(fail_message)
 
         return success
 
@@ -369,12 +378,12 @@ def olignore_keep_list(olignore_path):
     # get list of files recursively (ignore .* files)
     files = glob.glob('**', recursive=True)
 
-    click.echo("="*40)
+    #click.echo("="*40)
     if not os.path.isfile(olignore_path):
-        click.echo("\nNotice: .olignore file does not exist, will sync all items.")
+        #click.echo("\nNotice: .olignore file does not exist, will sync all items.")
         keep_list = files
     else:
-        click.echo("\n.olignore: using %s to filter items" % olignore_path)
+        #click.echo("\n.olignore: using %s to filter items" % olignore_path)
         with open(olignore_path, 'r') as f:
             ignore_pattern = f.read().splitlines()
 
